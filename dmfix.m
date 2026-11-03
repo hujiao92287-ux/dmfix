@@ -1,30 +1,38 @@
-// dmfix.m - puts the GL/Vulkan layer's frames on screen on devices without Metal 4.
+// dmfix.m - puts the GL layer's frames on screen on devices without Metal 4.
 //
 // Dungeon1 1.3.0 decides at start-up that the Metal device has no MTLGPUFamilyMetal4
 // (every A14/A15/A16 iPhone, the iPhone 12 Pro among them) and then takes the
-// "classic part only" path: mtl_init() sets g_classic = 1, and mtl_present_ext()
-// returns 0 on its first line. The game keeps running - audio plays, log.txt reports
-// vkPresentKHR / glSwap - but nothing is ever drawn to the layer.
+// "classic part only" path: mtl_init() sets g_classic = 1 and nothing is presented.
+// The game keeps running - the GL/Vulkan layer renders into its window textures,
+// audio plays, saves work - but the present path is Metal 4 only
+// (present_now -> present_encode_m4, MTL4CommandQueue), which does not exist on
+// these GPUs, so every frame ends up nowhere.
 //
-// This dylib hooks two local symbols of the main binary:
-//   mtl_ext_tex(void *tex)       the layer registers its window textures here;
-//                                serial -> MTLTexture is remembered
-//   mtl_present_ext(serial, ..)  the layer offers a finished frame; it is drawn to
-//                                the CAMetalLayer with the binary's own
-//                                present_pipeline() / present_encode()
-// The game, the shaders and the Metal 4 path on A17 Pro and newer are left alone:
-// on such a device the Metal 4 path never goes through the hooked functions and
-// nothing changes.
+// This dylib patches no code at all (an inline hook cannot restore PROT_EXEC on a
+// page it has written to: the app is signed, so the kernel refuses, and the app
+// dies the moment the patched function runs). It only reads the game's own state:
+//
+//   g_win            the GL layer's window struct: col[3] textures, cur ring index
+//   front_metal_layer / present_pipeline / present_encode
+//                    the program's own classic present code, which the screenshot
+//                    path already uses and which runs fine on any Metal device
+//
+// A 120 Hz timer watches g_win->cur. Every time it advances the layer has finished
+// a frame into col[old cur]; that texture is handed to the game's own
+// present_pipeline()/present_encode() and shown on the CAMetalLayer's drawable,
+// one swap later (so the GPU has certainly finished writing it).
+//
+// Nothing is written anywhere: a failure leaves the game exactly as it was, black
+// screen and all, with the reason in Documents/dmfix.log.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
-#import <mach/vm_page_size.h>
-#import <libkern/OSCacheControl.h>
 #import <pthread.h>
 #import <string.h>
 
@@ -51,17 +59,14 @@ static const struct nlist_64 *g_syms;
 static uint32_t g_nsyms;
 static intptr_t g_slide;
 static uintptr_t g_le_start, g_le_end;
-
-// symtab_command.symoff/stroff are file offsets; __LINKEDIT is mapped with
-// fileoff == vmaddr - slide - k, so the runtime address of file offset X is
-// (le_vmaddr + slide - le_fileoff + X). Adding X to le_vmaddr alone reads
-// le_fileoff bytes too far (27 MB here) and lands outside every region.
-// They must also be bounds-checked against the segment's *file* range
-// (fileoff .. fileoff + filesize), never against its vm size.
 static int g_image = -1;
 
 static void *find_sym(const char *name);
 
+// symtab_command.symoff/stroff are file offsets; __LINKEDIT is mapped with
+// fileoff == vmaddr - slide - k, so the runtime address of file offset X is
+// (le_vmaddr + slide - le_fileoff + X). They must also be bounds-checked against
+// the segment's *file* range (fileoff .. fileoff + filesize), never its vm size.
 static int load_symbols_for_image(uint32_t idx) {
     const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(idx);
     if (!mh || mh->magic != MH_MAGIC_64) return 0;
@@ -110,7 +115,8 @@ static int load_symbols(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         if (!load_symbols_for_image(i)) continue;
-        if (find_sym("_mtl_ext_tex") && find_sym("_mtl_present_ext")) { g_image = (int)i; return 1; }
+        if (find_sym("_g_win") && find_sym("_present_encode") &&
+            find_sym("_present_pipeline") && find_sym("_front_metal_layer")) { g_image = (int)i; return 1; }
         g_syms = NULL; g_strtab = NULL; g_nsyms = 0;
     }
     return 0;
@@ -128,183 +134,144 @@ static void *find_sym(const char *name) {
     return NULL;
 }
 
-#pragma mark - arm64 hook
-
-// movz x16,#lo / movk x16,#mid,lsl16 / movk x16,#hi,lsl32 / br x16
-// Four words, no alignment or range requirement (the address fits in 48 bits).
-static void write_abs_jump(uint32_t *at, uintptr_t dst) {
-    at[0] = 0xd2800010u | (uint32_t)((dst & 0xffff) << 5);                 // movz x16
-    at[1] = 0xf2a00010u | (uint32_t)(((dst >> 16) & 0xffff) << 5);         // movk x16, lsl 16
-    at[2] = 0xf2c00010u | (uint32_t)(((dst >> 32) & 0xffff) << 5);         // movk x16, lsl 32
-    at[3] = 0xd61f0200u;                                                   // br x16
-}
-
-static void *make_trampoline(void *target) {
-    vm_address_t mem = 0;
-    if (vm_allocate(mach_task_self(), &mem, (vm_size_t)vm_page_size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-        return NULL;
-    memcpy((void *)mem, target, 16);
-    write_abs_jump((uint32_t *)(mem + 16), (uintptr_t)target + 16);
-    if (vm_protect(mach_task_self(), mem, (vm_size_t)vm_page_size, FALSE,
-                   VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
-        vm_deallocate(mach_task_self(), mem, (vm_size_t)vm_page_size);
-        return NULL;
-    }
-    sys_icache_invalidate((void *)mem, (size_t)vm_page_size);
-    return (void *)mem;
-}
-
-static int patch_entry(void *target, const uint32_t expect[4], void *replacement) {
-    uint32_t *p = (uint32_t *)target;
-    if (memcmp(p, expect, 16) != 0) return -1;
-    uintptr_t page = (uintptr_t)target & ~((uintptr_t)vm_page_size - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), page, (vm_size_t)vm_page_size, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) { LOG(@"vm_protect rw failed: 0x%x", kr); return -1; }
-    write_abs_jump(p, (uintptr_t)replacement);
-    kr = vm_protect(mach_task_self(), page, (vm_size_t)vm_page_size, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) LOG(@"vm_protect rx failed: 0x%x", kr);
-    sys_icache_invalidate(target, 16);
-    return 0;
-}
-
 #pragma mark - the game's own present code
 
-typedef uint64_t (*ext_tex_fn)(void *tex);
-typedef uint64_t (*present_ext_fn)(uint64_t serial, double period, void *ev, uint64_t ev_val, const int *crop);
 typedef void *(*front_layer_fn)(void);
 typedef void (*pipeline_fn)(uint32_t format);
 typedef int (*encode_fn)(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int *crop);
 
-static ext_tex_fn orig_ext_tex;
 static front_layer_fn fn_front_layer;
 static pipeline_fn fn_pipeline;
 static encode_fn fn_encode;
 
-#define MAPN 32
-static uint64_t g_key[MAPN];
-static __unsafe_unretained id<MTLTexture> g_val[MAPN];
-static pthread_mutex_t g_map_mu = PTHREAD_MUTEX_INITIALIZER;
-static int g_val_next;
+// hle_gl.m: static struct { int made; uint32_t w, h; __strong id<MTLTexture> col[NWIN], ds;
+//                           uint64_t serial[NWIN], ticket[NWIN]; int cur; } g_win;
+// Offsets confirmed on 1.3.0 (win_make / eglSwapBuffers): col 0x10, ds 0x28,
+// serial 0x30, ticket 0x48, cur 0x60.
+#define NWIN 3
+typedef struct {
+    int made;
+    uint32_t w, h;
+    void *col[NWIN];
+    void *ds;
+    uint64_t serial[NWIN];
+    uint64_t ticket[NWIN];
+    int cur;
+} dm_win;
 
-static void map_put(uint64_t k, id<MTLTexture> t) {
-    pthread_mutex_lock(&g_map_mu);
-    int slot = -1;
-    for (int i = 0; i < MAPN && slot < 0; i++) if (g_key[i] == k) slot = i;
-    for (int i = 0; i < MAPN && slot < 0; i++) if (!g_key[i]) slot = i;
-    if (slot < 0) { slot = g_val_next; g_val_next = (g_val_next + 1) % MAPN; }
-    g_key[slot] = k; g_val[slot] = t;
-    pthread_mutex_unlock(&g_map_mu);
-}
+static dm_win *g_win;
 
-static id<MTLTexture> map_get(uint64_t k) {
-    id<MTLTexture> r = nil;
-    pthread_mutex_lock(&g_map_mu);
-    for (int i = 0; i < MAPN; i++) if (g_key[i] == k) { r = g_val[i]; break; }
-    pthread_mutex_unlock(&g_map_mu);
-    return r;
-}
+#pragma mark - presenter
 
 static id<MTLCommandQueue> g_queue;
-static int g_first = 1;
+static dispatch_source_t g_timer;
+static int g_last_cur = -1;
+static id<MTLTexture> g_hold;
+static unsigned long g_frames, g_ticks, g_miss_drawable, g_miss_layer, g_enc_fail;
+static int g_first_logged;
 
-static uint64_t hook_ext_tex(void *tex) {
-    uint64_t ser = orig_ext_tex(tex);
-    map_put(ser, (__bridge id<MTLTexture>)tex);
-    return ser;
+static void present_one(id<MTLTexture> src) {
+    if (!src) return;
+    void *lp = fn_front_layer();
+    if (!lp) { if (g_miss_layer++ < 3) LOG(@"present: front_metal_layer returned NULL"); return; }
+    CAMetalLayer *layer = (__bridge CAMetalLayer *)lp;
+    if (![layer isKindOfClass:[CAMetalLayer class]]) { if (g_miss_layer++ < 3) LOG(@"present: front layer is a %s", class_getName(object_getClass(layer))); return; }
+    layer.allowsNextDrawableTimeout = YES;   // never block the driver queue when a drawable is not ready
+
+    // The layer is sized by the app when it is laid out; on the classic path that may
+    // never have happened, so give it the game's own window size once.
+    if (g_win->w && g_win->h && (layer.drawableSize.width < 1 || layer.drawableSize.height < 1)) {
+        CGFloat sc = layer.contentsScale > 0 ? layer.contentsScale : 1;
+        layer.drawableSize = CGSizeMake(g_win->w * sc, g_win->h * sc);
+        LOG(@"present: layer had no drawable size, set to %.0fx%.0f", layer.drawableSize.width, layer.drawableSize.height);
+    }
+
+    id<CAMetalDrawable> dr = [layer nextDrawable];
+    if (!dr) {
+        if (g_miss_drawable++ < 3 || (g_miss_drawable % 300) == 0)
+            LOG(@"present: nextDrawable nil (%lu times, layer %.0fx%.0f drawable %.0fx%.0f scale %.2f superlayer %d)",
+                g_miss_drawable, layer.bounds.size.width, layer.bounds.size.height,
+                layer.drawableSize.width, layer.drawableSize.height, layer.contentsScale,
+                layer.superlayer != nil);
+        return;
+    }
+    if (!g_queue) g_queue = [layer.device newCommandQueue];
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) { if (g_miss_layer++ < 3) LOG(@"present: no command buffer"); return; }
+
+    fn_pipeline((uint32_t)dr.texture.pixelFormat);
+    if (!fn_encode(cb, src, dr.texture, NULL)) {
+        if (g_enc_fail++ < 3) LOG(@"present: present_encode refused %lux%lu fmt %lu -> %lux%lu fmt %lu",
+                                   (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat,
+                                   (unsigned long)dr.texture.width, (unsigned long)dr.texture.height,
+                                   (unsigned long)dr.texture.pixelFormat);
+        [cb commit];
+        return;
+    }
+    [cb presentDrawable:dr];
+    [cb commit];
+    g_frames++;
+
+    if (!g_first_logged) {
+        g_first_logged = 1;
+        LOG(@"present: first frame %lux%lu fmt %lu -> %lux%lu fmt %lu (layer %.0fx%.0f drawable %.0fx%.0f scale %.2f superlayer %d)",
+            (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat,
+            (unsigned long)dr.texture.width, (unsigned long)dr.texture.height, (unsigned long)dr.texture.pixelFormat,
+            layer.bounds.size.width, layer.bounds.size.height,
+            layer.drawableSize.width, layer.drawableSize.height, layer.contentsScale,
+            layer.superlayer != nil);
+    } else if ((g_frames % 300) == 0) {
+        LOG(@"present: %lu frames (%lu ticks)", g_frames, g_ticks);
+    }
 }
 
-static unsigned long g_calls, g_no_tex, g_no_layer, g_no_drawable, g_no_cb, g_no_encode, g_frames;
-
-static uint64_t hook_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int *crop) {
+// 120 Hz: g_win->cur advances once per eglSwapBuffers, i.e. once per game frame.
+static void dmfix_tick(void) {
     @autoreleasepool {
-        g_calls++;
-        id<MTLTexture> src = map_get(serial);
-        if (!src) {
-            if (g_no_tex++ < 3 || (g_no_tex % 300) == 0)
-                LOG(@"present: serial %llu is not registered (%lu calls, %lu misses)",
-                    (unsigned long long)serial, g_calls, g_no_tex);
-            return 0;
+        g_ticks++;
+        dm_win *w = g_win;
+        if (!w) return;
+        if (!w->made) {
+            g_last_cur = -1; g_hold = nil;
+            if ((g_ticks % 600) == 0) LOG(@"waiting: window not made yet");
+            return;
         }
-        void *lp = fn_front_layer ? fn_front_layer() : NULL;
-        if (!lp) {
-            if (g_no_layer++ < 3) LOG(@"present: front_metal_layer returned NULL");
-            return 0;
-        }
-        CAMetalLayer *layer = (__bridge CAMetalLayer *)lp;
-        id<CAMetalDrawable> dr = [layer nextDrawable];
-        if (!dr) {
-            if (g_no_drawable++ < 3 || (g_no_drawable % 300) == 0)
-                LOG(@"present: nextDrawable nil (frame %lu, layer %.0fx%.0f scale %.2f suspended %d)",
-                    g_no_drawable, layer.bounds.size.width, layer.bounds.size.height,
-                    layer.contentsScale, (int)layer.sublayers.count);
-            return 0;
-        }
-        if (!g_queue) g_queue = [layer.device newCommandQueue];
-        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-        if (!cb) {
-            if (g_no_cb++ < 3) LOG(@"present: no command buffer");
-            return 0;
-        }
-        if (ev) [cb encodeWaitForEvent:(__bridge id<MTLSharedEvent>)ev value:ev_val];
-        fn_pipeline((uint32_t)dr.texture.pixelFormat);
-        if (!fn_encode(cb, src, dr.texture, crop)) {
-            if (g_no_encode++ < 3) LOG(@"present: encode failed");
-            [cb commit];
-            return 0;
-        }
-        [cb presentDrawable:dr];
-        [cb commit];
-        g_frames++;
-        if (g_first) {
-            g_first = 0;
-            LOG(@"present: first frame %lux%lu (%s) -> %lux%lu fmt %lu (layer %.0fx%.0f scale %.2f crop %p)",
-                (unsigned long)src.width, (unsigned long)src.height,
-                src.pixelFormat == MTLPixelFormatBGRA8Unorm ? "bgra8" :
-                src.pixelFormat == MTLPixelFormatRGBA8Unorm ? "rgba8" : "other",
-                (unsigned long)dr.texture.width, (unsigned long)dr.texture.height,
-                (unsigned long)dr.texture.pixelFormat,
-                layer.bounds.size.width, layer.bounds.size.height, layer.contentsScale, crop);
-        } else if ((g_frames % 300) == 0) {
-            LOG(@"present: %lu frames", g_frames);
+        int cur = w->cur;
+        if (cur < 0 || cur >= NWIN) return;
+        if (cur != g_last_cur) {
+            int prev = g_last_cur;
+            g_last_cur = cur;
+            if (prev < 0) return;   // first sighting: nothing has been drawn into any buffer yet
+            id<MTLTexture> done = (__bridge id<MTLTexture>)w->col[prev];
+            if (g_hold) present_one(g_hold);   // one swap late: the GPU has surely finished writing it
+            g_hold = done;
         }
     }
-    return 0;
 }
 
 #pragma mark - entry
 
 __attribute__((constructor)) static void dmfix_init(void) {
     @autoreleasepool {
-        LOG(@"init");
+        LOG(@"init (v3: no code patching, present side driver)");
         if (!load_symbols()) { LOG(@"no symbol table with the game's symbols (%u images scanned)", _dyld_image_count()); return; }
-        LOG(@"symtab: image %d (%s), %u entries, linkedit %p..%p", g_image,
-            _dyld_get_image_name((uint32_t)g_image), g_nsyms, (void *)g_le_start, (void *)g_le_end);
+        LOG(@"symtab: image %d (%s), %u entries", g_image, _dyld_get_image_name((uint32_t)g_image), g_nsyms);
 
         fn_front_layer = (front_layer_fn)find_sym("_front_metal_layer");
         fn_pipeline = (pipeline_fn)find_sym("_present_pipeline");
         fn_encode = (encode_fn)find_sym("_present_encode");
-        void *ext_tex = find_sym("_mtl_ext_tex");
-        void *present_ext = find_sym("_mtl_present_ext");
-        LOG(@"symbols: layer %p pipeline %p encode %p ext_tex %p present_ext %p",
-            fn_front_layer, fn_pipeline, fn_encode, ext_tex, present_ext);
-        if (!fn_front_layer || !fn_pipeline || !fn_encode || !ext_tex || !present_ext) return;
+        g_win = (dm_win *)find_sym("_g_win");
+        LOG(@"symbols: layer %p pipeline %p encode %p g_win %p",
+            fn_front_layer, fn_pipeline, fn_encode, g_win);
+        if (!fn_front_layer || !fn_pipeline || !fn_encode || !g_win) return;
 
-        // 1.3.0 prologues; another build is left untouched
-        static const uint32_t ext_tex_pro[4] = { 0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xaa0003f3 };
-        static const uint32_t present_pro[4] = { 0xd10343ff, 0x6d0923e9, 0xa90a57f6, 0xa90b4ff4 };
-
-        if (memcmp(ext_tex, ext_tex_pro, 16) != 0) { LOG(@"mtl_ext_tex: other prologue, skipped"); return; }
-        void *t1 = make_trampoline(ext_tex);
-        if (!t1) { LOG(@"mtl_ext_tex: no trampoline"); return; }
-        orig_ext_tex = (ext_tex_fn)t1;
-        if (patch_entry(ext_tex, ext_tex_pro, (void *)hook_ext_tex) != 0) { LOG(@"mtl_ext_tex: patch failed"); return; }
-
-        if (memcmp(present_ext, present_pro, 16) != 0) { LOG(@"mtl_present_ext: other prologue, skipped"); return; }
-        if (!make_trampoline(present_ext)) { LOG(@"mtl_present_ext: no trampoline"); return; }
-        if (patch_entry(present_ext, present_pro, (void *)hook_present_ext) != 0) { LOG(@"mtl_present_ext: patch failed"); return; }
-
-        LOG(@"hooks installed");
+        dispatch_queue_t q = dispatch_queue_create("dmfix.present", DISPATCH_QUEUE_SERIAL);
+        g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        if (!g_timer) { LOG(@"no timer"); return; }
+        dispatch_source_set_timer(g_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  8ull * NSEC_PER_MSEC, 1ull * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(g_timer, ^{ dmfix_tick(); });
+        dispatch_resume(g_timer);
+        LOG(@"present driver running");
     }
 }
