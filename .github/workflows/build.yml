@@ -1,0 +1,40 @@
+name: build dmfix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Compile dmfix.dylib
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=16.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 \
+            -install_name @executable_path/Frameworks/dmfix.dylib \
+            -framework Foundation -framework Metal -framework QuartzCore \
+            -o dmfix.dylib dmfix.m
+          lipo -info dmfix.dylib
+          otool -L dmfix.dylib
+          xcrun --sdk iphoneos codesign --force -s - dmfix.dylib
+          codesign -dv dmfix.dylib 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmfix-dylib
+          path: dmfix.dylib
+          retention-days: 30
