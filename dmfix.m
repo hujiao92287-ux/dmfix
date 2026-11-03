@@ -56,37 +56,64 @@ static uintptr_t g_le_start, g_le_end;
 // fileoff == vmaddr - slide - k, so the runtime address of file offset X is
 // (le_vmaddr + slide - le_fileoff + X). Adding X to le_vmaddr alone reads
 // le_fileoff bytes too far (27 MB here) and lands outside every region.
-static void load_symbols(void) {
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
-    g_slide = _dyld_get_image_vmaddr_slide(0);
-    if (!mh) return;
-    uint64_t le_vmaddr = 0, le_fileoff = 0, le_size = 0;
+// They must also be bounds-checked against the segment's *file* range
+// (fileoff .. fileoff + filesize), never against its vm size.
+static int g_image = -1;
+
+static void *find_sym(const char *name);
+
+static int load_symbols_for_image(uint32_t idx) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(idx);
+    if (!mh || mh->magic != MH_MAGIC_64) return 0;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(idx);
+    uint64_t le_vmaddr = 0, le_fileoff = 0, le_filesize = 0;
     const struct load_command *lc = (const struct load_command *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
             if (strcmp(sg->segname, SEG_LINKEDIT) == 0) {
-                le_vmaddr = sg->vmaddr; le_fileoff = sg->fileoff; le_size = sg->vmsize;
+                le_vmaddr = sg->vmaddr; le_fileoff = sg->fileoff; le_filesize = sg->filesize;
             }
         }
         lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
     }
-    if (!le_vmaddr || !le_size) return;
-    uintptr_t base = (uintptr_t)(le_vmaddr + (uint64_t)g_slide - le_fileoff);
-    g_le_start = (uintptr_t)(le_vmaddr + (uint64_t)g_slide);
-    g_le_end = g_le_start + (uintptr_t)le_size;
+    if (!le_vmaddr || !le_filesize) return 0;
+    uintptr_t base = (uintptr_t)(le_vmaddr + (uint64_t)slide - le_fileoff);
+    uintptr_t le_start = (uintptr_t)(le_vmaddr + (uint64_t)slide);
+    uint64_t le_file_end = le_fileoff + le_filesize;
+
     lc = (const struct load_command *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         if (lc->cmd == LC_SYMTAB) {
             const struct symtab_command *st = (const struct symtab_command *)lc;
-            if (st->symoff >= le_size || st->stroff >= le_size) return;
+            uint64_t sym_end = (uint64_t)st->symoff + (uint64_t)st->nsyms * sizeof(struct nlist_64);
+            uint64_t str_end = (uint64_t)st->stroff + st->strsize;
+            if ((uint64_t)st->symoff < le_fileoff || sym_end > le_file_end ||
+                (uint64_t)st->stroff < le_fileoff || str_end > le_file_end)
+                return 0;
             g_syms = (const struct nlist_64 *)(base + st->symoff);
             g_strtab = (const char *)(base + st->stroff);
             g_nsyms = st->nsyms;
-            return;
+            g_le_start = le_start;
+            g_le_end = le_start + (uintptr_t)le_filesize;
+            g_slide = slide;
+            return 1;
         }
         lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
     }
+    return 0;
+}
+
+// The dylib is injected as LC_LOAD_DYLIB, so image 0 should be the game, but
+// scan every image anyway and keep the one that actually exports the symbols.
+static int load_symbols(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        if (!load_symbols_for_image(i)) continue;
+        if (find_sym("_mtl_ext_tex") && find_sym("_mtl_present_ext")) { g_image = (int)i; return 1; }
+        g_syms = NULL; g_strtab = NULL; g_nsyms = 0;
+    }
+    return 0;
 }
 
 static void *find_sym(const char *name) {
@@ -188,33 +215,59 @@ static uint64_t hook_ext_tex(void *tex) {
     return ser;
 }
 
+static unsigned long g_calls, g_no_tex, g_no_layer, g_no_drawable, g_no_cb, g_no_encode, g_frames;
+
 static uint64_t hook_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int *crop) {
     @autoreleasepool {
+        g_calls++;
         id<MTLTexture> src = map_get(serial);
-        if (!src) { LOG(@"present: serial %llu is not registered", (unsigned long long)serial); return 0; }
+        if (!src) {
+            if (g_no_tex++ < 3 || (g_no_tex % 300) == 0)
+                LOG(@"present: serial %llu is not registered (%lu calls, %lu misses)",
+                    (unsigned long long)serial, g_calls, g_no_tex);
+            return 0;
+        }
         void *lp = fn_front_layer ? fn_front_layer() : NULL;
-        if (!lp) return 0;
+        if (!lp) {
+            if (g_no_layer++ < 3) LOG(@"present: front_metal_layer returned NULL");
+            return 0;
+        }
         CAMetalLayer *layer = (__bridge CAMetalLayer *)lp;
         id<CAMetalDrawable> dr = [layer nextDrawable];
-        if (!dr) return 0;
+        if (!dr) {
+            if (g_no_drawable++ < 3 || (g_no_drawable % 300) == 0)
+                LOG(@"present: nextDrawable nil (frame %lu, layer %.0fx%.0f scale %.2f suspended %d)",
+                    g_no_drawable, layer.bounds.size.width, layer.bounds.size.height,
+                    layer.contentsScale, (int)layer.sublayers.count);
+            return 0;
+        }
         if (!g_queue) g_queue = [layer.device newCommandQueue];
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-        if (!cb) return 0;
+        if (!cb) {
+            if (g_no_cb++ < 3) LOG(@"present: no command buffer");
+            return 0;
+        }
         if (ev) [cb encodeWaitForEvent:(__bridge id<MTLSharedEvent>)ev value:ev_val];
         fn_pipeline((uint32_t)dr.texture.pixelFormat);
         if (!fn_encode(cb, src, dr.texture, crop)) {
-            LOG(@"present: encode failed");
+            if (g_no_encode++ < 3) LOG(@"present: encode failed");
             [cb commit];
             return 0;
         }
         [cb presentDrawable:dr];
         [cb commit];
+        g_frames++;
         if (g_first) {
             g_first = 0;
-            LOG(@"present: first frame %lux%lu -> %lux%lu (layer %.0fx%.0f scale %.2f)",
+            LOG(@"present: first frame %lux%lu (%s) -> %lux%lu fmt %lu (layer %.0fx%.0f scale %.2f crop %p)",
                 (unsigned long)src.width, (unsigned long)src.height,
+                src.pixelFormat == MTLPixelFormatBGRA8Unorm ? "bgra8" :
+                src.pixelFormat == MTLPixelFormatRGBA8Unorm ? "rgba8" : "other",
                 (unsigned long)dr.texture.width, (unsigned long)dr.texture.height,
-                layer.bounds.size.width, layer.bounds.size.height, layer.contentsScale);
+                (unsigned long)dr.texture.pixelFormat,
+                layer.bounds.size.width, layer.bounds.size.height, layer.contentsScale, crop);
+        } else if ((g_frames % 300) == 0) {
+            LOG(@"present: %lu frames", g_frames);
         }
     }
     return 0;
@@ -225,9 +278,9 @@ static uint64_t hook_present_ext(uint64_t serial, double period, void *ev, uint6
 __attribute__((constructor)) static void dmfix_init(void) {
     @autoreleasepool {
         LOG(@"init");
-        load_symbols();
-        if (!g_syms) { LOG(@"no symbol table in the main binary"); return; }
-        LOG(@"symtab %u entries, linkedit %p..%p", g_nsyms, (void *)g_le_start, (void *)g_le_end);
+        if (!load_symbols()) { LOG(@"no symbol table with the game's symbols (%u images scanned)", _dyld_image_count()); return; }
+        LOG(@"symtab: image %d (%s), %u entries, linkedit %p..%p", g_image,
+            _dyld_get_image_name((uint32_t)g_image), g_nsyms, (void *)g_le_start, (void *)g_le_end);
 
         fn_front_layer = (front_layer_fn)find_sym("_front_metal_layer");
         fn_pipeline = (pipeline_fn)find_sym("_present_pipeline");
