@@ -50,26 +50,36 @@ static const char *g_strtab;
 static const struct nlist_64 *g_syms;
 static uint32_t g_nsyms;
 static intptr_t g_slide;
+static uintptr_t g_le_start, g_le_end;
 
+// symtab_command.symoff/stroff are file offsets; __LINKEDIT is mapped with
+// fileoff == vmaddr - slide - k, so the runtime address of file offset X is
+// (le_vmaddr + slide - le_fileoff + X). Adding X to le_vmaddr alone reads
+// le_fileoff bytes too far (27 MB here) and lands outside every region.
 static void load_symbols(void) {
     const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
     g_slide = _dyld_get_image_vmaddr_slide(0);
     if (!mh) return;
-    uint64_t le = 0;
+    uint64_t le_vmaddr = 0, le_fileoff = 0, le_size = 0;
     const struct load_command *lc = (const struct load_command *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            if (strcmp(sg->segname, SEG_LINKEDIT) == 0) le = sg->vmaddr;
+            if (strcmp(sg->segname, SEG_LINKEDIT) == 0) {
+                le_vmaddr = sg->vmaddr; le_fileoff = sg->fileoff; le_size = sg->vmsize;
+            }
         }
         lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
     }
-    if (!le) return;
+    if (!le_vmaddr || !le_size) return;
+    uintptr_t base = (uintptr_t)(le_vmaddr + (uint64_t)g_slide - le_fileoff);
+    g_le_start = (uintptr_t)(le_vmaddr + (uint64_t)g_slide);
+    g_le_end = g_le_start + (uintptr_t)le_size;
     lc = (const struct load_command *)(mh + 1);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         if (lc->cmd == LC_SYMTAB) {
             const struct symtab_command *st = (const struct symtab_command *)lc;
-            uintptr_t base = (uintptr_t)(le + g_slide);
+            if (st->symoff >= le_size || st->stroff >= le_size) return;
             g_syms = (const struct nlist_64 *)(base + st->symoff);
             g_strtab = (const char *)(base + st->stroff);
             g_nsyms = st->nsyms;
@@ -84,8 +94,9 @@ static void *find_sym(const char *name) {
     for (uint32_t i = 0; i < g_nsyms; i++) {
         uint32_t n = g_syms[i].n_un.n_strx;
         if (!n || (g_syms[i].n_type & N_STAB)) continue;
+        if ((uintptr_t)(g_strtab + n) >= g_le_end) continue;
         if (strcmp(g_strtab + n, name) == 0 && g_syms[i].n_value)
-            return (void *)(uintptr_t)(g_syms[i].n_value + g_slide);
+            return (void *)(uintptr_t)(g_syms[i].n_value + (uint64_t)g_slide);
     }
     return NULL;
 }
@@ -213,8 +224,10 @@ static uint64_t hook_present_ext(uint64_t serial, double period, void *ev, uint6
 
 __attribute__((constructor)) static void dmfix_init(void) {
     @autoreleasepool {
+        LOG(@"init");
         load_symbols();
         if (!g_syms) { LOG(@"no symbol table in the main binary"); return; }
+        LOG(@"symtab %u entries, linkedit %p..%p", g_nsyms, (void *)g_le_start, (void *)g_le_end);
 
         fn_front_layer = (front_layer_fn)find_sym("_front_metal_layer");
         fn_pipeline = (pipeline_fn)find_sym("_present_pipeline");
